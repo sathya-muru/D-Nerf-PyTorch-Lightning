@@ -18,7 +18,7 @@ except ImportError:
 # pytorch-lightning imports
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning import LightningModule, Trainer
-from pytorch_lightning.logging import TestTubeLogger
+from pytorch_lightning.loggers import TestTubeLogger
 
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
@@ -453,8 +453,8 @@ class train(LightningModule):
         self.render_kwargs_test['raw_noise_std'] = 0.
 
         self.bds_dict = {
-            'near' : near,
-            'far' : far,
+            'near' : 2.,
+            'far' : 6.,
         }
         self.render_kwargs_train.update(self.bds_dict)
         self.render_kwargs_test.update(self.bds_dict)
@@ -733,7 +733,7 @@ class train(LightningModule):
         """
         return rgb, disp, acc, extras, target_s, extras_prev, extras_next, frame_time_prev, frame_time_next
 
-    def training_setp(self):
+    def training_step(self):
         log = {'lr': self.args.lrate}
         args=self.args
 
@@ -830,16 +830,17 @@ if __name__=='__main__':
     # torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
     nerf = train()
-
+    
     if nerf.args.ft_path is not None and nerf.args.ft_path!='None':
-            ckpts = ModelCheckpoint(nerf.ft_path, monitor='val/loss', mode='min')
+            ckpts = ModelCheckpoint(nerf.args.ft_path, monitor='val/loss', mode='min')
     else:
-        ckpts = ModelCheckpoint((os.path.join(nerf.args.basedir, nerf.args.expname, f) for f in sorted(os.listdir(os.path.join(nerf.args.basedir, nerf.args.expname))) if 'tar' in f), monitor='val/loss', mode='min')
+        # path = os.path.join(nerf.args.basedir, nerf.args.expname, f) for f in sorted(os.listdir(os.path.join(nerf.args.basedir, nerf.args.expname)))
+        ckpts = ModelCheckpoint(filepath=os.path.join(f'ckpts/{nerf.args.expname}','{epoch:d}'), monitor='val/loss', mode='min')
                                 
     
     logger = TestTubeLogger(
         save_dir='logs',
-        name=nerf.expname,
+        name=nerf.args.expname,
         debug=False,
         create_git_tag=False
     )
@@ -847,7 +848,6 @@ if __name__=='__main__':
     trainer = Trainer(max_epochs=nerf.args.N_rand,
                       checkpoint_callback=ckpts,
                       logger=logger,
-                      early_stop_callback=None,
                       weights_summary=None,
                       progress_bar_refresh_rate=1,
                       gpus=4,
