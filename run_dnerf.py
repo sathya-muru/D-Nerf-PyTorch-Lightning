@@ -296,7 +296,7 @@ def config_parser():
                         help='number of rays processed in parallel, decrease if running out of memory')
     parser.add_argument("--netchunk", type=int, default=1024*64, 
                         help='number of pts sent through network in parallel, decrease if running out of memory')
-    parser.add_argument("--no_batching", action='store_true', 
+    parser.add_argument("--use_batching", action='store_true', 
                         help='only take random rays from 1 image at a time')
     parser.add_argument("--no_reload", action='store_true', 
                         help='do not reload weights from saved ckpt')
@@ -459,10 +459,10 @@ class train(LightningModule):
         self.render_kwargs_train.update(self.bds_dict)
         self.render_kwargs_test.update(self.bds_dict)
 
-    def configure_optimizer(self):
+    def configure_optimizers(self):
 
         # Create optimizer
-        optimizer = torch.optim.Adam(self.parameters, lr=self.args.lrate, betas=(0.9, 0.999))
+        optimizers = torch.optim.Adam(self.parameters(), lr=self.args.lrate, betas=(0.9, 0.999))
 
         if self.args.do_half_precision:
             print("Run model at half precision")
@@ -579,7 +579,10 @@ class train(LightningModule):
 
         return ret
 
-    def prepare_data(self, args):
+    def prepare_data(self):
+        
+        args = self.args
+
         # Load data
         if args.dataset_type == 'blender':
             self.images, self.poses, self.times, self.render_poses, self.render_times, self.hwf, self.i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
@@ -614,15 +617,15 @@ class train(LightningModule):
             self.render_times = np.array(self.times[self.i_test])
 
     def train_dataloader(self):
-        return DataLoader(self.i_train, num_workers=3, batch_size=self.args.batch_size, pin_memory=True)
+        return DataLoader(self.i_train, num_workers=3, batch_size=self.args.N_rand, pin_memory=True)
 
     def val_dataloader(self):
         return DataLoader(self.i_val, shuffle=False, num_workers=3, batch_size=1, pin_memory=True)
 
-    def validation_step():
-        pass
+    # def validation_step():
+    
 
-    def forward(self, args, rays_rgb, i_batch, N_rand):
+    def forward(self, rays_rgb, i_batch, N_rand):
 
         # Move testing data to GPU
         self.render_poses = torch.Tensor(self.render_poses)
@@ -633,11 +636,12 @@ class train(LightningModule):
         if self.args.use_batching:
             rays_rgb = torch.Tensor(rays_rgb)
 
+        args=self.args
 
 
         N_iters = args.N_iter + 1
         print('Begin')
-
+        start = 0
         
         start = start + 1
         for i in trange(start, N_iters):
@@ -645,7 +649,7 @@ class train(LightningModule):
 
             # Sample random ray batch
             if self.args.use_batching:
-                # raise NotImplementedError("Time not implemented")
+                raise NotImplementedError("Time not implemented")
 
                 # Random over all images
                 batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
@@ -658,6 +662,7 @@ class train(LightningModule):
                     rand_idx = torch.randperm(rays_rgb.shape[0])
                     rays_rgb = rays_rgb[rand_idx]
                     i_batch = 0
+                # frame_time=None
 
             else:
                 # Random from one image
@@ -696,32 +701,32 @@ class train(LightningModule):
                     batch_rays = torch.stack([rays_o, rays_d], 0)
                     target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
-        #####  Core optimization loop  #####
-        rgb, disp, acc, extras = render(self.H, self.W, self.focal, chunk=args.chunk, rays=batch_rays, frame_time=frame_time,
-                                                verbose=i < 10, retraw=True,
-                                                **self.render_kwargs_train)
+            #####  Core optimization loop  #####
+            rgb, disp, acc, extras = render(self.H, self.W, self.focal, chunk=args.chunk, rays=batch_rays, frame_time=frame_time,
+                                                    verbose=i < 10, retraw=True,
+                                                    **self.render_kwargs_train)
 
-        if args.add_tv_loss:
-            frame_time_prev = self.times[img_i - 1] if img_i > 0 else None
-            frame_time_next = self.times[img_i + 1] if img_i < self.times.shape[0] - 1 else None
+            if args.add_tv_loss:
+                frame_time_prev = self.times[img_i - 1] if img_i > 0 else None
+                frame_time_next = self.times[img_i + 1] if img_i < self.times.shape[0] - 1 else None
 
-            if frame_time_prev is not None and frame_time_next is not None:
-                if np.random.rand() > .5:
-                    frame_time_prev = None
-                else:
-                    frame_time_next = None
+                if frame_time_prev is not None and frame_time_next is not None:
+                    if np.random.rand() > .5:
+                        frame_time_prev = None
+                    else:
+                        frame_time_next = None
 
-            if frame_time_prev is not None:
-                rand_time_prev = frame_time_prev + (frame_time - frame_time_prev) * torch.rand(1)[0]
-                _, _, _, extras_prev = render(self.H, self.W, self.focal, chunk=args.chunk, rays=batch_rays, frame_time=rand_time_prev,
-                                                verbose=i < 10, retraw=True, z_vals=extras['z_vals'].detach(),
-                                                **self.render_kwargs_train)
+                if frame_time_prev is not None:
+                    rand_time_prev = frame_time_prev + (frame_time - frame_time_prev) * torch.rand(1)[0]
+                    _, _, _, extras_prev = render(self.H, self.W, self.focal, chunk=args.chunk, rays=batch_rays, frame_time=rand_time_prev,
+                                                    verbose=i < 10, retraw=True, z_vals=extras['z_vals'].detach(),
+                                                    **self.render_kwargs_train)
 
-            if frame_time_next is not None:
-                rand_time_next = frame_time + (frame_time_next - frame_time) * torch.rand(1)[0]
-                _, _, _, extras_next = render(self.H, self.W, self.focal, chunk=args.chunk, rays=batch_rays, frame_time=rand_time_next,
-                                                verbose=i < 10, retraw=True, z_vals=extras['z_vals'].detach(),
-                                                **self.render_kwargs_train)
+                if frame_time_next is not None:
+                    rand_time_next = frame_time + (frame_time_next - frame_time) * torch.rand(1)[0]
+                    _, _, _, extras_next = render(self.H, self.W, self.focal, chunk=args.chunk, rays=batch_rays, frame_time=rand_time_next,
+                                                    verbose=i < 10, retraw=True, z_vals=extras['z_vals'].detach(),
+                                                    **self.render_kwargs_train)
         """
         ###   update learning rate   ###
         decay_rate = 0.1
@@ -732,8 +737,9 @@ class train(LightningModule):
         ################################
         """
         return rgb, disp, acc, extras, target_s, extras_prev, extras_next, frame_time_prev, frame_time_next
+    
 
-    def training_step(self):
+    def training_step(self, batch, ray_batch):
         log = {'lr': self.args.lrate}
         args=self.args
 
@@ -761,12 +767,15 @@ class train(LightningModule):
             
         # Prepare raybatch tensor if batching random rays
         N_rand = args.N_rand
-        use_batching = not args.no_batching
-        if use_batching:
+        # use_batching = not args.no_batching
+        # use_batching = True
+        
+        if args.use_batching:
             # For random ray batching
             print('get rays')
             rays = np.stack([get_rays_np(self.H, self.W, self.focal, p) for p in self.poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
             print('done, concats')
+            # global rays_rgb
             rays_rgb = np.concatenate([rays, self.images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
             rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
             rays_rgb = np.stack([rays_rgb[i] for i in self.i_train], 0) # train images only
@@ -774,12 +783,14 @@ class train(LightningModule):
             rays_rgb = rays_rgb.astype(np.float32)
             print('shuffle rays')
             np.random.shuffle(rays_rgb)
+            # self.rays_rgb = rays_rgb,
+            print(rays_rgb)
 
             print('done')
             i_batch = 0
 
         # call forward function
-        rgb, disp, acc, extras, target_s, extras_prev, extras_next, frame_time_prev, frame_time_next = self(rays_rgb, i_batch, N_rand)
+        rgb, disp, acc, extras, target_s, extras_prev, extras_next, frame_time_prev, frame_time_next = self.forward(rays_rgb, i_batch, N_rand)
         
         # calc loss
 
@@ -854,5 +865,5 @@ if __name__=='__main__':
                       distributed_backend='ddp',
                       num_sanity_val_steps=1,
                       benchmark=True,
-                      profiler=True)
+                      profiler=False)
     trainer.fit(nerf)
