@@ -4,7 +4,7 @@ datadir = ./data/lego
 dataset_type = blender
 
 nerf_type = direct_temporal
-use_batching = True
+use_batching = False
 not_zero_canonical = False
 use_viewdirs = True
 

@@ -206,7 +206,103 @@ def render_path(render_poses, render_times, hwf, chunk, render_kwargs, gt_imgs=N
 
     return rgbs, disps
 
+def render_rays(ray_batch,
+            network_fn,
+            network_query_fn,
+            N_samples,
+            retraw=False,
+            lindisp=False,
+            perturb=0.,
+            N_importance=0,
+            network_fine=None,
+            white_bkgd=False,
+            raw_noise_std=0.,
+            verbose=False,
+            pytest=False,
+            z_vals=None,
+            use_two_models_for_fine=False):
 
+    N_rays = ray_batch.shape[0]
+    rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
+    viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 9 else None
+    bounds = torch.reshape(ray_batch[...,6:9], [-1,1,3])
+    near, far, frame_time = bounds[...,0], bounds[...,1], bounds[...,2] # [-1,1]
+    z_samples = None
+    rgb_map_0, disp_map_0, acc_map_0, position_delta_0 = None, None, None, None
+
+    if z_vals is None:
+        t_vals = torch.linspace(0., 1., steps=N_samples)
+        if not lindisp:
+            z_vals = near * (1.-t_vals) + far * (t_vals)
+        else:
+            z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
+
+        z_vals = z_vals.expand([N_rays, N_samples])
+
+        if perturb > 0.:
+            # get intervals between samples
+            mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+            upper = torch.cat([mids, z_vals[...,-1:]], -1)
+            lower = torch.cat([z_vals[...,:1], mids], -1)
+            # stratified samples in those intervals
+            t_rand = torch.rand(z_vals.shape)
+
+            # Pytest, overwrite u with numpy's fixed random numbers
+            if pytest:
+                np.random.seed(0)
+                t_rand = np.random.rand(*list(z_vals.shape))
+                t_rand = torch.Tensor(t_rand)
+
+            z_vals = lower + (upper - lower) * t_rand
+
+        pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
+
+
+        if N_importance <= 0:
+            raw, position_delta = network_query_fn(pts, viewdirs, frame_time, network_fn)
+            rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+
+        else:
+            if use_two_models_for_fine:
+                raw, position_delta_0 = network_query_fn(pts, viewdirs, frame_time, network_fn)
+                rgb_map_0, disp_map_0, acc_map_0, weights, _ = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+
+            else:
+                with torch.no_grad():
+                    raw, _ = network_query_fn(pts, viewdirs, frame_time, network_fn)
+                    _, _, _, weights, _ = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+
+            z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+            z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
+            z_samples = z_samples.detach()
+            z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
+
+    pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
+    run_fn = network_fn if network_fine is None else network_fine
+    raw, position_delta = network_query_fn(pts, viewdirs, frame_time, run_fn)
+    rgb_map, disp_map, acc_map, weights, _ = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+
+    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map, 'z_vals' : z_vals,
+        'position_delta' : position_delta}
+    if retraw:
+        ret['raw'] = raw
+    if N_importance > 0:
+        if rgb_map_0 is not None:
+            ret['rgb0'] = rgb_map_0
+        if disp_map_0 is not None:
+            ret['disp0'] = disp_map_0
+        if acc_map_0 is not None:
+            ret['acc0'] = acc_map_0
+        if position_delta_0 is not None:
+            ret['position_delta_0'] = position_delta_0
+        if z_samples is not None:
+            ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
+
+    for k in ret:
+        if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
+            print(f"! [Numerical Error] {k} contains nan or inf.")
+
+    return ret
 
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
     """Transforms model's predictions to semantically meaningful values.
@@ -481,104 +577,6 @@ class train(LightningModule):
 
         return ckpts
 
-    def render_rays(self, ray_batch,
-                network_fn,
-                network_query_fn,
-                N_samples,
-                retraw=False,
-                lindisp=False,
-                perturb=0.,
-                N_importance=0,
-                network_fine=None,
-                white_bkgd=False,
-                raw_noise_std=0.,
-                verbose=False,
-                pytest=False,
-                z_vals=None,
-                use_two_models_for_fine=False):
-
-        N_rays = ray_batch.shape[0]
-        rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
-        viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 9 else None
-        bounds = torch.reshape(ray_batch[...,6:9], [-1,1,3])
-        near, far, frame_time = bounds[...,0], bounds[...,1], bounds[...,2] # [-1,1]
-        z_samples = None
-        rgb_map_0, disp_map_0, acc_map_0, position_delta_0 = None, None, None, None
-
-        if z_vals is None:
-            t_vals = torch.linspace(0., 1., steps=N_samples)
-            if not lindisp:
-                z_vals = near * (1.-t_vals) + far * (t_vals)
-            else:
-                z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
-
-            z_vals = z_vals.expand([N_rays, N_samples])
-
-            if perturb > 0.:
-                # get intervals between samples
-                mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
-                upper = torch.cat([mids, z_vals[...,-1:]], -1)
-                lower = torch.cat([z_vals[...,:1], mids], -1)
-                # stratified samples in those intervals
-                t_rand = torch.rand(z_vals.shape)
-
-                # Pytest, overwrite u with numpy's fixed random numbers
-                if pytest:
-                    np.random.seed(0)
-                    t_rand = np.random.rand(*list(z_vals.shape))
-                    t_rand = torch.Tensor(t_rand)
-
-                z_vals = lower + (upper - lower) * t_rand
-
-            pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
-
-
-            if N_importance <= 0:
-                raw, position_delta = network_query_fn(pts, viewdirs, frame_time, network_fn)
-                rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
-
-            else:
-                if use_two_models_for_fine:
-                    raw, position_delta_0 = network_query_fn(pts, viewdirs, frame_time, network_fn)
-                    rgb_map_0, disp_map_0, acc_map_0, weights, _ = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
-
-                else:
-                    with torch.no_grad():
-                        raw, _ = network_query_fn(pts, viewdirs, frame_time, network_fn)
-                        _, _, _, weights, _ = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
-
-                z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
-                z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
-                z_samples = z_samples.detach()
-                z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
-
-        pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
-        run_fn = network_fn if network_fine is None else network_fine
-        raw, position_delta = network_query_fn(pts, viewdirs, frame_time, run_fn)
-        rgb_map, disp_map, acc_map, weights, _ = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
-
-        ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map, 'z_vals' : z_vals,
-            'position_delta' : position_delta}
-        if retraw:
-            ret['raw'] = raw
-        if N_importance > 0:
-            if rgb_map_0 is not None:
-                ret['rgb0'] = rgb_map_0
-            if disp_map_0 is not None:
-                ret['disp0'] = disp_map_0
-            if acc_map_0 is not None:
-                ret['acc0'] = acc_map_0
-            if position_delta_0 is not None:
-                ret['position_delta_0'] = position_delta_0
-            if z_samples is not None:
-                ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
-
-        for k in ret:
-            if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
-                print(f"! [Numerical Error] {k} contains nan or inf.")
-
-        return ret
-
     def prepare_data(self):
         
         args = self.args
@@ -788,6 +786,9 @@ class train(LightningModule):
 
             print('done')
             i_batch = 0
+        else:
+            rays_rgb = None
+            i_batch =0
 
         # call forward function
         rgb, disp, acc, extras, target_s, extras_prev, extras_next, frame_time_prev, frame_time_next = self.forward(rays_rgb, i_batch, N_rand)
@@ -841,7 +842,7 @@ if __name__=='__main__':
     # torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
     nerf = train()
-    
+    nerf = nerf.to('cuda')
     if nerf.args.ft_path is not None and nerf.args.ft_path!='None':
             ckpts = ModelCheckpoint(nerf.args.ft_path, monitor='val/loss', mode='min')
     else:
