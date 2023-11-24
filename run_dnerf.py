@@ -73,6 +73,8 @@ def run_network(inputs, viewdirs, frame_time, fn, embed_fn, embeddirs_fn, embedt
         input_dirs = viewdirs[:,None].expand(inputs.shape)
         input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
         embedded_dirs = embeddirs_fn(input_dirs_flat)
+        embedded = embedded.cuda()
+        embedded_dirs = embedded_dirs.cuda()
         embedded = torch.cat([embedded, embedded_dirs], -1)
 
     outputs_flat, position_delta_flat = batchify(fn, netchunk)(embedded, embedded_times)
@@ -189,8 +191,10 @@ def render_path(render_poses, render_times, hwf, chunk, render_kwargs, gt_imgs=N
 
     for i, (c2w, frame_time) in enumerate(zip(tqdm(render_poses), render_times)):
         rgb, disp, acc, _ = render(H, W, focal, chunk=chunk, c2w=c2w[:3,:4], frame_time=frame_time, **render_kwargs)
-        rgbs.append(rgb.cpu().numpy())
-        disps.append(disp.cpu().numpy())
+        gbs.append(rgb.numpy())
+        disps.append(disp.numpy())
+        #e rgbs.append(rgb.cpu().numpy())
+        # disps.append(disp.cpu().numpy())
 
         if savedir is not None:
             rgb8_estim = to8b(rgbs[-1])
@@ -270,13 +274,21 @@ def render_rays(ray_batch,
             else:
                 with torch.no_grad():
                     raw, _ = network_query_fn(pts, viewdirs, frame_time, network_fn)
+                    raw = raw.cuda()
+                    z_vals = z_vals.cuda()
+                    rays_d = rays_d.cuda()
                     _, _, _, weights, _ = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
             z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+            z_vals_mid = z_vals_mid.cuda()
+            weights = weights.cuda()
             z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
             z_samples = z_samples.detach()
+            z_samples = z_samples.cuda()
+            z_vals = z_vals.cuda()
             z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
-
+    rays_d = rays_d.cuda()
+    rays_o = rays_o.cuda()
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
     run_fn = network_fn if network_fine is None else network_fine
     raw, position_delta = network_query_fn(pts, viewdirs, frame_time, run_fn)
@@ -317,10 +329,13 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
         depth_map: [num_rays]. Estimated distance to object.
     """
-    raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
 
+    raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
+    z_vals = z_vals.cuda()
     dists = z_vals[...,1:] - z_vals[...,:-1]
-    dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
+    dists = dists.cuda()
+    rays_d = rays_d.cuda()
+    dists = torch.cat([dists, torch.Tensor([1e10]).cuda().expand(dists[...,:1].shape)], -1).cuda() # [N_rays, N_samples]
 
     dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
 
@@ -335,11 +350,14 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
             noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
             noise = torch.Tensor(noise)
 
+    raw = raw.cuda()
+    dists = dists.cuda()
+
     alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
+    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)).to('cuda'), 1.-alpha + 1e-10], -1), -1)[:, :-1]
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
-
+    z_vals = z_vals.cuda()
     depth_map = torch.sum(weights * z_vals, -1)
     disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
     acc_map = torch.sum(weights, -1)
@@ -493,15 +511,16 @@ class train(LightningModule):
 
         self.parser = config_parser()
         self.args = self.parser.parse_args()
+        # self.device = torch.device("cuda")
 
         # Create nerf model
-        self.embed_fn, self.input_ch = get_embedder(self.args.multires, 3, self.args.i_embed)
-        self.embedtime_fn, self.input_ch_time = get_embedder(self.args.multires, 1, self.args.i_embed)
+        self.embed_fn, self.input_ch = self.get_embedder(self.args.multires, 3, self.args.i_embed)
+        self.embedtime_fn, self.input_ch_time = self.get_embedder(self.args.multires, 1, self.args.i_embed)
 
         self.input_ch_views = 0
         self.embeddirs_fn = None
         if self.args.use_viewdirs:
-            self.embeddirs_fn, self.input_ch_views = get_embedder(self.args.multires_views, 3, self.args.i_embed)
+            self.embeddirs_fn, self.input_ch_views = self.get_embedder(self.args.multires_views, 3, self.args.i_embed)
 
         self.output_ch = 5 if self.args.N_importance > 0 else 4
         skips = [4]
@@ -554,6 +573,23 @@ class train(LightningModule):
         }
         self.render_kwargs_train.update(self.bds_dict)
         self.render_kwargs_test.update(self.bds_dict)
+
+    def get_embedder(self, multires, input_dims, i=0):
+        if i == -1:
+            return nn.Identity(), input_dims
+        
+        embed_kwargs = {
+                    'include_input' : True,
+                    'input_dims' : input_dims,
+                    'max_freq_log2' : multires-1,
+                    'num_freqs' : multires,
+                    'log_sampling' : True,
+                    'periodic_fns' : [torch.sin, torch.cos],
+        }
+    
+        embedder_obj = Embedder(**embed_kwargs)
+        embed = lambda x, eo=embedder_obj : eo.embed(x)
+        return embed, embedder_obj.out_dim
 
     def configure_optimizers(self):
 
@@ -615,9 +651,11 @@ class train(LightningModule):
             self.render_times = np.array(self.times[self.i_test])
 
     def train_dataloader(self):
+        # generator=torch.Generator(device='cuda')
         return DataLoader(self.i_train, num_workers=3, batch_size=self.args.N_rand, pin_memory=True)
 
     def val_dataloader(self):
+        # generator=torch.Generator(device='cuda')
         return DataLoader(self.i_val, shuffle=False, num_workers=3, batch_size=1, pin_memory=True)
 
     # def validation_step():
@@ -633,6 +671,7 @@ class train(LightningModule):
         self.times = torch.Tensor(self.times)
         if self.args.use_batching:
             rays_rgb = torch.Tensor(rays_rgb)
+            
 
         args=self.args
 
@@ -725,6 +764,11 @@ class train(LightningModule):
                     _, _, _, extras_next = render(self.H, self.W, self.focal, chunk=args.chunk, rays=batch_rays, frame_time=rand_time_next,
                                                     verbose=i < 10, retraw=True, z_vals=extras['z_vals'].detach(),
                                                     **self.render_kwargs_train)
+            else:
+                extras_prev = None
+                extras_next = None
+                frame_time_prev = None
+                frame_time_next = None
         """
         ###   update learning rate   ###
         decay_rate = 0.1
@@ -841,13 +885,16 @@ class train(LightningModule):
 if __name__=='__main__':
     # torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
+    # nerf = train().to('cuda')
     nerf = train()
-    nerf = nerf.to('cuda')
+    # nerf.generator = torch.Generator(device='cuda')
+    
     if nerf.args.ft_path is not None and nerf.args.ft_path!='None':
-            ckpts = ModelCheckpoint(nerf.args.ft_path, monitor='val/loss', mode='min')
+            ckpts = ModelCheckpoint(nerf.args.ft_path, mode='min')
     else:
         # path = os.path.join(nerf.args.basedir, nerf.args.expname, f) for f in sorted(os.listdir(os.path.join(nerf.args.basedir, nerf.args.expname)))
-        ckpts = ModelCheckpoint(filepath=os.path.join(f'ckpts/{nerf.args.expname}','{epoch:d}'), monitor='val/loss', mode='min')
+        # ckpts = ModelCheckpoint(filepath=os.path.join(f'ckpts/{nerf.args.expname}','{epoch:d}'), monitor='val/loss', mode='min')
+        ckpts = ModelCheckpoint(filepath=os.path.join(f'ckpts/{nerf.args.expname}','{epoch:d}'), mode='min')
                                 
     
     logger = TestTubeLogger(
@@ -862,9 +909,11 @@ if __name__=='__main__':
                       logger=logger,
                       weights_summary=None,
                       progress_bar_refresh_rate=1,
+                      accelerator='gpu',
                       gpus=4,
                       distributed_backend='ddp',
-                      num_sanity_val_steps=1,
                       benchmark=True,
                       profiler=False)
+
+    # trainer = Trainer(accelerator="gpu", devices=4)
     trainer.fit(nerf)
